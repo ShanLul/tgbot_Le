@@ -2,6 +2,7 @@
 Telegram消息处理器
 """
 import logging
+import re
 from decimal import Decimal, InvalidOperation
 from sqlalchemy.ext.asyncio import AsyncSession
 from telegram import Update
@@ -9,6 +10,7 @@ from telegram.ext import ContextTypes
 
 from app.services.price_parser import price_parser
 from app.services.database_service import db_service
+from app.bot.config import settings
 from app.utils.auth import (
     permission_checker,
     get_user_id,
@@ -21,6 +23,40 @@ from app.utils.auth import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def clean_message_text(text: str) -> str:
+    """
+    清洗消息文本，只保留机器人需要的字符
+
+    保留：数字、中文字符、基本运算符、基本标点
+    删除：其他所有特殊符号和表情
+
+    Args:
+        text: 原始文本
+
+    Returns:
+        清洗后的文本
+    """
+    if not text:
+        return text
+
+    # 只保留需要的字符：
+    # \u4e00-\u9fff 中文字符
+    # \d 数字
+    # +\-*/=() 运算符和括号
+    # \s 空白字符
+    # ,.;:，。；：、！!? 基本标点
+    pattern = re.compile(r"[^\u4e00-\u9fff\d+\-*/=()×\s,.;:，。；：、！!?.]")
+    text = pattern.sub("", text)
+
+    # 替换乘号为 *
+    text = text.replace("×", "*")
+
+    # 移除多余的空白字符
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
 
 
 class MessageHandler:
@@ -60,7 +96,8 @@ class MessageHandler:
         # 自动注册/更新用户信息
         await self._register_user(update, db)
 
-        text = update.message.text.strip()
+        # 清洗消息文本（移除表情符号和特殊字符）
+        text = clean_message_text(update.message.text)
         user_id = get_user_id(update)
         chat_id = get_chat_id(update)
         user_name = get_user_name(update)
@@ -81,17 +118,20 @@ class MessageHandler:
             return
 
         # 2. 检查是否为清账指令
+        print(f"[DEBUG] 检查清账: text='{text}', is_clear={is_clear_command(text)}", flush=True)
         if is_clear_command(text):
             await self._handle_clear(update, db, chat_id, user_id, user_name, group_name)
             return
 
-        # 3. 解析价格（不再需要 a/A 前缀）
+        # 3. 只有消息包含"总"字时才解析价格
+        if "总" not in text:
+            return  # 不处理，静默忽略
+
         result = price_parser.parse(text)
 
         if not result.success:
             await update.message.reply_text(
-                f"❌ 无法识别价格信息\n\n{result.error or '请确认格式正确'}\n\n"
-                "提示：订单内容需要包含 `总xxx` 或 `合计xxx`"
+                f"❌ 无法识别价格信息\n\n{result.error or '请确认格式正确'}"
             )
             return
 
@@ -184,8 +224,13 @@ class MessageHandler:
         group_name: str
     ):
         """处理清账指令"""
+        # 调试信息
+        print(f"[DEBUG] 清账命令 - user_id={user_id}, chat_id={chat_id}", flush=True)
+        print(f"[DEBUG] 配置的超级管理员: {settings.super_admin_id_list}", flush=True)
+
         # 检查权限
         is_admin = await permission_checker.is_admin(db, user_id, chat_id)
+        print(f"[DEBUG] is_admin={is_admin}", flush=True)
         if not is_admin:
             await update.message.reply_text("❌ 只有管理员才能清账")
             return

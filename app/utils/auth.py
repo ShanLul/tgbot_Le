@@ -154,6 +154,7 @@ def extract_amount_command(text: str) -> tuple[Literal["+", "-"] | None, float |
 def is_clear_command(text: str) -> bool:
     """
     检查是否为清账指令
+    支持"清账"和"清帐"（两个常用字）
 
     Args:
         text: 待检查的文本
@@ -163,7 +164,9 @@ def is_clear_command(text: str) -> bool:
     """
     if not text:
         return False
-    return text.strip() == "清账"
+    stripped = text.strip()
+    # 同时支持"清账"和"清帐"
+    return stripped == "清账" or stripped == "清帐"
 
 
 # 模块级函数（方便导入使用）
