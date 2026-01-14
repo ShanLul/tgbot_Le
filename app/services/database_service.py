@@ -183,8 +183,6 @@ class DatabaseService:
             group.total_amount += abs(amount)
         elif trans_type in ["reduce", "clear"]:
             group.total_amount -= abs(amount)
-            if group.total_amount < 0:
-                group.total_amount = Decimal("0")
         group.updated_at = datetime.now()
 
         await db.commit()
