@@ -1,0 +1,230 @@
+"""
+Telegram消息处理器
+"""
+import logging
+from decimal import Decimal, InvalidOperation
+from sqlalchemy.ext.asyncio import AsyncSession
+from telegram import Update
+from telegram.ext import ContextTypes
+
+from app.services.price_parser import price_parser
+from app.services.database_service import db_service
+from app.utils.auth import (
+    permission_checker,
+    get_user_id,
+    get_chat_id,
+    get_user_name,
+    get_group_name,
+    check_has_prefix,
+    extract_amount_command,
+    is_clear_command
+)
+
+logger = logging.getLogger(__name__)
+
+
+class MessageHandler:
+    """消息处理器"""
+
+    async def _register_user(self, update: Update, db: AsyncSession):
+        """自动注册/更新用户信息（仅私聊时）"""
+        if not update.message or not update.message.from_user:
+            return
+
+        # 只在私聊时注册用户
+        if update.message.chat.type != "private":
+            return
+
+        user = update.message.from_user
+        await db_service.register_user(
+            db=db,
+            user_id=user.id,
+            username=user.username or "",
+            first_name=user.first_name or "",
+            last_name=user.last_name or "",
+            language_code=user.language_code or "",
+            is_premium=user.is_premium or False,
+            is_bot=user.is_bot or False
+        )
+
+    async def handle_message(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        db: AsyncSession
+    ):
+        """处理文本消息"""
+        if not update.message or not update.message.text:
+            return
+
+        # 自动注册/更新用户信息
+        await self._register_user(update, db)
+
+        text = update.message.text.strip()
+        user_id = get_user_id(update)
+        chat_id = get_chat_id(update)
+        user_name = get_user_name(update)
+        group_name = get_group_name(update)
+
+        # 调试信息
+        chat = update.message.chat
+        debug_info = f"DEBUG: user_id={user_id}, chat_id={chat_id}, chat_type={chat.type if chat else 'None'}, chat_title={chat.title if chat else 'None'}, group_name='{group_name}'"
+        print(debug_info, flush=True)
+        logger.info(debug_info)
+
+        # 1. 检查是否为管理员调整金额指令
+        cmd_op, cmd_amount = extract_amount_command(text)
+        if cmd_op:
+            await self._handle_amount_adjust(
+                update, db, chat_id, user_id, user_name, group_name, cmd_op, cmd_amount
+            )
+            return
+
+        # 2. 检查是否为清账指令
+        if is_clear_command(text):
+            await self._handle_clear(update, db, chat_id, user_id, user_name, group_name)
+            return
+
+        # 3. 解析价格（不再需要 a/A 前缀）
+        result = price_parser.parse(text)
+
+        if not result.success:
+            await update.message.reply_text(
+                f"❌ 无法识别价格信息\n\n{result.error or '请确认格式正确'}\n\n"
+                "提示：订单内容需要包含 `总xxx` 或 `合计xxx`"
+            )
+            return
+
+        # 5. 添加订单
+        try:
+            await db_service.add_order(
+                db=db,
+                chat_id=chat_id,
+                user_id=user_id,
+                user_name=user_name,
+                amount=result.amount,
+                raw_text=text[:500],  # 限制长度
+                group_name=group_name
+            )
+
+            # 获取当前总额
+            group = await db_service.get_group(db, chat_id)
+
+            response = f"✅ 订单已记录\n"
+            response += f"💰 金额: `{result.amount}` 元\n"
+            response += f"📊 当前总额: `{group.total_amount}` 元"
+
+            if result.expression:
+                response += f"\n🧮 算式: `{result.expression}`"
+
+            await update.message.reply_text(response, parse_mode="Markdown")
+
+        except Exception as e:
+            await update.message.reply_text(f"❌ 记录订单时出错: {str(e)}")
+
+    async def _handle_amount_adjust(
+        self,
+        update: Update,
+        db: AsyncSession,
+        chat_id: int,
+        user_id: int,
+        user_name: str,
+        group_name: str,
+        operation: str,
+        amount: float
+    ):
+        """处理金额调整指令"""
+        # 检查权限
+        is_admin = await permission_checker.is_admin(db, user_id, chat_id)
+        if not is_admin:
+            await update.message.reply_text("❌ 只有管理员才能调整账单")
+            return
+
+        try:
+            decimal_amount = Decimal(str(amount))
+
+            if operation == "+":
+                trans_type = "add"
+                sign = "+"
+                action = "增加"
+            else:
+                trans_type = "reduce"
+                sign = "-"
+                action = "减少"
+
+            await db_service.add_transaction(
+                db=db,
+                chat_id=chat_id,
+                user_id=user_id,
+                user_name=user_name,
+                trans_type=trans_type,
+                amount=decimal_amount,
+                note=f"管理员{action}: {user_name}",
+                group_name=group_name
+            )
+
+            group = await db_service.get_group(db, chat_id)
+
+            await update.message.reply_text(
+                f"✅ 已{action}账单 `{decimal_amount}` 元\n"
+                f"📊 当前总额: `{group.total_amount}` 元",
+                parse_mode="Markdown"
+            )
+
+        except (InvalidOperation, Exception) as e:
+            await update.message.reply_text(f"❌ 调整账单时出错: {str(e)}")
+
+    async def _handle_clear(
+        self,
+        update: Update,
+        db: AsyncSession,
+        chat_id: int,
+        user_id: int,
+        user_name: str,
+        group_name: str
+    ):
+        """处理清账指令"""
+        # 检查权限
+        is_admin = await permission_checker.is_admin(db, user_id, chat_id)
+        if not is_admin:
+            await update.message.reply_text("❌ 只有管理员才能清账")
+            return
+
+        # 获取当前金额（先确保群组存在）
+        group = await db_service.get_or_create_group(db, chat_id, group_name)
+        current_amount = group.total_amount if group else Decimal("0")
+
+        # 执行清账
+        success = await db_service.clear_group_data(db, chat_id)
+
+        if success:
+            await update.message.reply_text(
+                f"🗑️ 账单已清空\n"
+                f"💰 清空前总额: `{current_amount}` 元\n"
+                f"📊 当前总额: `0.00` 元\n"
+                f"⚠️ 所有历史订单和交易记录已删除",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text("❌ 清账失败，请稍后重试")
+
+    async def handle_error(
+        self,
+        update: object,
+        context: ContextTypes.DEFAULT_TYPE
+    ):
+        """处理错误"""
+        print(f"Error: {context.error}")
+
+        # update 可能是 None 或不是 Update 对象
+        if update and isinstance(update, Update) and update.message:
+            try:
+                await update.message.reply_text(
+                    f"❌ 处理消息时出错: {str(context.error)}"
+                )
+            except Exception:
+                pass  # 忽略回复错误
+
+
+# 全局消息处理器实例
+message_handler = MessageHandler()

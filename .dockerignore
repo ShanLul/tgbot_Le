@@ -1,0 +1,43 @@
+# 环境变量（不提交敏感信息，服务器上单独创建）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+venv/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 数据库（保留本地数据，避免覆盖）
+data/*.db
+data/*.db-journal
+
+# 日志
+logs/
+*.log
+
+# Git
+.git/
+.gitignore
+
+# 文档
+README.md
+PROJECT_PLAN.md
+
+# 其他
+.DS_Store
+Thumbs.db
+nul
