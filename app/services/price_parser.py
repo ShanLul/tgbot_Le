@@ -134,56 +134,74 @@ class PriceParser:
             return None
 
     def _safe_eval(self, expression: str) -> float | None:
-        """安全计算算式（递归实现）"""
+        """
+        安全计算算式（递归下降解析，正确处理运算符优先级）
+
+        运算符优先级：括号 > 乘除 > 加减
+        结合性：从左到右
+        """
         try:
-            # 处理括号
+            # 移除空格
+            expression = expression.replace(" ", "")
+
+            # 空表达式
+            if not expression:
+                return None
+
+            # 1. 处理括号（从内到外）
             while "(" in expression:
                 start = expression.rfind("(")
                 end = expression.find(")", start)
                 if end == -1:
-                    return None
+                    return None  # 括号不匹配
                 sub_expr = expression[start + 1:end]
                 sub_result = self._safe_eval(sub_expr)
                 if sub_result is None:
                     return None
                 expression = expression[:start] + str(sub_result) + expression[end + 1:]
 
-            # 处理乘除
-            for op in ["*/"]:
-                parts = expression.split(op)
-                if len(parts) > 1:
-                    left = self._safe_eval(parts[0])
-                    right = self._safe_eval(parts[1])
-                    if left is None or right is None:
+            # 2. 从右到左查找 + 或 -（优先级最低，最后计算）
+            # 这样可以确保 "50*2+8" 被解析为 "(50*2)+8" 而不是 "50*(2+8)"
+            for op in ["+", "-"]:
+                pos = expression.rfind(op)
+                # 跳过开头的负号（如 "-5+3" 中的 -）
+                if pos == 0 and op == "-":
+                    continue
+                # 找到了不在开头的运算符
+                if pos > 0:
+                    left = expression[:pos]
+                    right = expression[pos + 1:]
+                    # 递归计算左右两边
+                    left_val = self._safe_eval(left)
+                    right_val = self._safe_eval(right)
+                    if left_val is None or right_val is None:
+                        return None
+                    if op == "+":
+                        return left_val + right_val
+                    else:
+                        return left_val - right_val
+
+            # 3. 从右到左查找 * 或 /（优先级较高，先计算）
+            for op in ["*", "/"]:
+                pos = expression.rfind(op)
+                if pos > 0:
+                    left = expression[:pos]
+                    right = expression[pos + 1:]
+                    # 递归计算左右两边
+                    left_val = self._safe_eval(left)
+                    right_val = self._safe_eval(right)
+                    if left_val is None or right_val is None:
                         return None
                     if op == "*":
-                        return left * right
-                    elif op == "/":
-                        if right == 0:
+                        return left_val * right_val
+                    else:
+                        if right_val == 0:
                             return None
-                        return left / right
+                        return left_val / right_val
 
-            # 处理加减
-            result = 0.0
-            sign = 1
-            i = 0
-            while i < len(expression):
-                char = expression[i]
-                if char == "+":
-                    sign = 1
-                elif char == "-":
-                    sign = -1
-                elif char.isdigit() or char == ".":
-                    # 提取数字
-                    j = i
-                    while j < len(expression) and (expression[j].isdigit() or expression[j] == "."):
-                        j += 1
-                    num = float(expression[i:j])
-                    result += sign * num
-                    i = j - 1
-                i += 1
+            # 4. 没有运算符，直接返回数字
+            return float(expression)
 
-            return result
         except Exception:
             return None
 
