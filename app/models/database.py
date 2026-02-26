@@ -14,11 +14,19 @@ class Base(DeclarativeBase):
     pass
 
 
-# 创建异步引擎
+# 创建异步引擎（针对200+群组高并发场景优化）
+# pool_size: 保持连接池大小，SQLite 不需要连接池但设置以防未来迁移
+# pool_recycle: 自动回收连接，防止连接过期
+# pool_pre_ping: 使用前测试连接
+# connect_args: SQLite 特定配置
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
     pool_pre_ping=True,
+    pool_size=settings.DB_POOL_SIZE,
+    max_overflow=settings.DB_MAX_OVERFLOW,
+    pool_recycle=settings.DB_POOL_RECYCLE,
+    connect_args={"check_same_thread": False} if settings.DATABASE_URL.startswith("sqlite") else {},
 )
 
 # 创建会话工厂

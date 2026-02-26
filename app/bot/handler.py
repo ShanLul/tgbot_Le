@@ -4,6 +4,7 @@ Telegram消息处理器
 import logging
 import re
 from decimal import Decimal, InvalidOperation
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -21,6 +22,8 @@ from app.utils.auth import (
     extract_amount_command,
     is_clear_command
 )
+from app.utils.concurrency import db_semaphore, message_rate_limiter, price_parse_rate_limiter
+from app.utils.monitoring import performance_monitor
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +96,39 @@ class MessageHandler:
         if not update.message or not update.message.text:
             return
 
+        # 记录消息
+        await performance_monitor.record_message()
+
+        # 检查群组限流
+        chat_id = get_chat_id(update)
+        if not await message_rate_limiter.is_allowed(chat_id):
+            logger.warning(f"群组 {chat_id} 超过限流，跳过处理")
+            return
+
+        # 使用数据库并发控制
+        async with db_semaphore:
+            try:
+                await self._process_message(update, context, db)
+            except SQLAlchemyError as e:
+                logger.error(f"数据库错误处理消息 (chat_id={chat_id}): {e}")
+                await performance_monitor.record_error()
+                # 不回复用户，避免刷屏
+            except Exception as e:
+                logger.error(f"处理消息时发生错误 (chat_id={chat_id}): {e}", exc_info=True)
+                await performance_monitor.record_error()
+                try:
+                    if update.message and hasattr(update.message, 'reply_text'):
+                        await update.message.reply_text("❌ 处理消息时出错，请稍后重试")
+                except Exception:
+                    pass
+
+    async def _process_message(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        db: AsyncSession
+    ):
+        """实际处理消息的逻辑"""
         # 自动注册/更新用户信息
         await self._register_user(update, db)
 
@@ -103,12 +139,6 @@ class MessageHandler:
         user_name = get_user_name(update)
         group_name = get_group_name(update)
 
-        # 调试信息
-        chat = update.message.chat
-        debug_info = f"DEBUG: user_id={user_id}, chat_id={chat_id}, chat_type={chat.type if chat else 'None'}, chat_title={chat.title if chat else 'None'}, group_name='{group_name}'"
-        print(debug_info, flush=True)
-        logger.info(debug_info)
-
         # 1. 检查是否为管理员调整金额指令
         cmd_op, cmd_amount = extract_amount_command(text)
         if cmd_op:
@@ -118,7 +148,6 @@ class MessageHandler:
             return
 
         # 2. 检查是否为清账指令
-        print(f"[DEBUG] 检查清账: text='{text}', is_clear={is_clear_command(text)}", flush=True)
         if is_clear_command(text):
             await self._handle_clear(update, db, chat_id, user_id, user_name, group_name)
             return
@@ -126,6 +155,11 @@ class MessageHandler:
         # 3. 只有消息包含"总"字时才解析价格
         if "总" not in text:
             return  # 不处理，静默忽略
+
+        # 检查价格解析限流
+        if not await price_parse_rate_limiter.is_allowed(user_id):
+            await update.message.reply_text("⚠️ 价格解析请求过于频繁，请稍后再试")
+            return
 
         result = price_parser.parse(text)
 
@@ -136,31 +170,27 @@ class MessageHandler:
             return
 
         # 5. 添加订单
-        try:
-            await db_service.add_order(
-                db=db,
-                chat_id=chat_id,
-                user_id=user_id,
-                user_name=user_name,
-                amount=result.amount,
-                raw_text=text[:500],  # 限制长度
-                group_name=group_name
-            )
+        await db_service.add_order(
+            db=db,
+            chat_id=chat_id,
+            user_id=user_id,
+            user_name=user_name,
+            amount=result.amount,
+            raw_text=text[:500],  # 限制长度
+            group_name=group_name
+        )
 
-            # 获取当前总额
-            group = await db_service.get_group(db, chat_id)
+        # 获取当前总额
+        group = await db_service.get_group(db, chat_id)
 
-            response = f"✅ 订单已记录\n"
-            response += f"💰 金额: `{result.amount}` 元\n"
-            response += f"📊 当前总额: `{group.total_amount}` 元"
+        response = f"✅ 订单已记录\n"
+        response += f"💰 金额: `{result.amount}` 元\n"
+        response += f"📊 当前总额: `{group.total_amount}` 元"
 
-            if result.expression:
-                response += f"\n🧮 算式: `{result.expression}`"
+        if result.expression:
+            response += f"\n🧮 算式: `{result.expression}`"
 
-            await update.message.reply_text(response, parse_mode="Markdown")
-
-        except Exception as e:
-            await update.message.reply_text(f"❌ 记录订单时出错: {str(e)}")
+        await update.message.reply_text(response, parse_mode="Markdown")
 
     async def _handle_amount_adjust(
         self,
@@ -224,13 +254,8 @@ class MessageHandler:
         group_name: str
     ):
         """处理清账指令"""
-        # 调试信息
-        print(f"[DEBUG] 清账命令 - user_id={user_id}, chat_id={chat_id}", flush=True)
-        print(f"[DEBUG] 配置的超级管理员: {settings.super_admin_id_list}", flush=True)
-
         # 检查权限
         is_admin = await permission_checker.is_admin(db, user_id, chat_id)
-        print(f"[DEBUG] is_admin={is_admin}", flush=True)
         if not is_admin:
             await update.message.reply_text("❌ 只有管理员才能清账")
             return
@@ -259,16 +284,28 @@ class MessageHandler:
         context: ContextTypes.DEFAULT_TYPE
     ):
         """处理错误"""
-        print(f"Error: {context.error}")
+        error = context.error
+        logger.error(f"处理更新时发生错误: {error}", exc_info=True)
+
+        # 记录错误
+        await performance_monitor.record_error()
 
         # update 可能是 None 或不是 Update 对象
         if update and isinstance(update, Update) and update.message:
             try:
-                await update.message.reply_text(
-                    f"❌ 处理消息时出错: {str(context.error)}"
-                )
-            except Exception:
-                pass  # 忽略回复错误
+                # 根据错误类型返回不同的消息
+                error_msg = "❌ 处理消息时出错"
+                if "timeout" in str(error).lower():
+                    error_msg = "❌ 请求超时，请稍后重试"
+                elif "flood" in str(error).lower():
+                    error_msg = "⚠️ 发送消息过于频繁，请稍后再试"
+                elif "blocked" in str(error).lower():
+                    # 用户屏蔽了机器人，不回复
+                    return
+
+                await update.message.reply_text(error_msg)
+            except Exception as e:
+                logger.error(f"发送错误消息失败: {e}")
 
 
 # 全局消息处理器实例

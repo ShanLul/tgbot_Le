@@ -25,6 +25,25 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     LOG_FILE: str = "logs/bot.log"
 
+    # 性能配置
+    # 数据库连接池大小
+    DB_POOL_SIZE: int = 5
+    # 最大溢出连接数
+    DB_MAX_OVERFLOW: int = 10
+    # 连接回收时间（秒）
+    DB_POOL_RECYCLE: int = 3600
+
+    # 并发配置
+    # 最大并发数据库操作数
+    MAX_DB_CONCURRENT: int = 50
+    # 每个群组每分钟最大消息数
+    MAX_MESSAGES_PER_GROUP_PER_MINUTE: int = 100
+    # 每个用户每分钟最大价格解析次数
+    MAX_PRICE_PARSE_PER_USER_PER_MINUTE: int = 50
+
+    # 代理配置（访问 Telegram API 需要）
+    PROXY_URL: str = "http://127.0.0.1:7897"
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

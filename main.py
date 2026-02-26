@@ -7,7 +7,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from telegram import Update
 from telegram.ext import (
@@ -21,6 +21,7 @@ from app.bot.config import settings
 from app.bot.commands import command_handlers
 from app.bot.handler import message_handler
 from app.models.database import init_db, async_session_maker
+from app.utils.monitoring import performance_monitor
 
 
 # 配置日志
@@ -55,8 +56,26 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("数据库初始化完成")
 
-    # 创建Telegram应用
-    telegram_app = Application.builder().token(settings.BOT_TOKEN).build()
+    # 启动性能监控
+    await performance_monitor.start_monitoring(interval_seconds=120)
+    logger.info("性能监控已启动")
+
+    # 创建Telegram应用（使用代理）
+    if settings.PROXY_URL:
+        import httpx
+        from telegram.request._httpxrequest import HTTPXRequest
+        # 创建带代理的请求对象（增加超时时间）
+        request = HTTPXRequest(
+            proxy=settings.PROXY_URL,
+            connection_pool_size=20,
+            read_timeout=60,
+            write_timeout=60,
+            connect_timeout=30,
+        )
+        telegram_app = Application.builder().token(settings.BOT_TOKEN).request(request).build()
+        logger.info(f"使用代理: {settings.PROXY_URL}")
+    else:
+        telegram_app = Application.builder().token(settings.BOT_TOKEN).build()
 
     # 创建命令回调（带db session）
     async def start_callback(update, context):
@@ -118,6 +137,12 @@ async def lifespan(app: FastAPI):
     # 注册错误处理器
     telegram_app.add_error_handler(message_handler.handle_error)
 
+    # 调试：记录所有更新
+    async def debug_all_updates(update: Update, context):
+        logger.info(f"收到更新: {update.update_id}, 类型: {update.effective_chat.type if update.effective_chat else 'None'}")
+
+    telegram_app.add_handler(MessageHandler(filters.ALL, debug_all_updates), group=-1)
+
     # 启动bot
     await telegram_app.initialize()
     await telegram_app.start()
@@ -131,6 +156,8 @@ async def lifespan(app: FastAPI):
 
     # 关闭时
     logger.info("正在关闭 LeBot2...")
+    # 停止性能监控
+    await performance_monitor.stop_monitoring()
     if telegram_app:
         await telegram_app.updater.stop()
         await telegram_app.stop()
@@ -160,7 +187,22 @@ async def root():
 @app.get("/health")
 async def health():
     """健康检查"""
-    return {"status": "healthy"}
+    health_status = performance_monitor.is_healthy()
+    status_code = 200 if health_status["healthy"] else 503
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "healthy" if health_status["healthy"] else "unhealthy",
+            "issues": health_status["issues"]
+        }
+    )
+
+
+@app.get("/stats")
+async def stats():
+    """获取统计信息"""
+    return performance_monitor.get_stats()
 
 
 @app.get("/bot/info")
