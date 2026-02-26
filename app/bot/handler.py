@@ -183,14 +183,8 @@ class MessageHandler:
         # 获取当前总额
         group = await db_service.get_group(db, chat_id)
 
-        response = f"✅ 订单已记录\n"
-        response += f"💰 金额: `{result.amount}` 元\n"
-        response += f"📊 当前总额: `{group.total_amount}` 元"
-
-        if result.expression:
-            response += f"\n🧮 算式: `{result.expression}`"
-
-        await update.message.reply_text(response, parse_mode="Markdown")
+        response = f"💰 {result.amount} 元\n📊 订单总额: {group.total_amount} 元"
+        await update.message.reply_text(response)
 
     async def _handle_amount_adjust(
         self,
